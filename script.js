@@ -96,14 +96,134 @@ function googleMapsTransitURL(from,to,mode){
  const params=new URLSearchParams({api:"1",origin:`${from.lat},${from.lon}`,destination:`${to.lat},${to.lon}`,travelmode:mode==="driving"?"driving":mode==="walking"?"walking":"transit"});
  return `https://www.google.com/maps/dir/?${params.toString()}`;
 }
-function renderTransit(from,to){
- const url=googleMapsTransitURL(from,to,"transit");
- $("routePanel").innerHTML=`<div class="route-summary"><div class="summary-top"><div><h3>電車・公共交通での行き方</h3><p>${esc(from.name)} から<br>${esc(to.name)} まで</p></div><span class="route-badge">乗換案内</span></div><p style="margin-top:11px">電車の路線・乗換駅・出発時刻・運賃・所要時間は、最新の経路検索で確認できます。下のボタンから経路を開いてください。</p><a class="route-link" href="${url}" target="_blank" rel="noopener noreferrer">電車のルート・乗換案内を開く ↗</a></div>`;
- setText("routeStatus","公共交通の詳細はGoogle マップで確認できます。出発・到着時刻や運行状況はリンク先で確認してください。");
- if(routeLayer){map.removeLayer(routeLayer);routeLayer=null}
- const bounds=L.latLngBounds([[from.lat,from.lon],[to.lat,to.lon]]);
- map.fitBounds(bounds.pad(.2),{maxZoom:13});
+const TRANSIT_API = "https://api.transit.ls8h.com";
+
+(function addTransitStyles(){
+ const style=document.createElement("style");
+ style.textContent=`
+ .transit-option{border:1px solid #e7edf6;border-radius:16px;padding:14px;margin:12px 0;background:#fff;box-shadow:0 5px 18px #263b5b08}
+ .transit-option.selected{border-color:#4779f5;box-shadow:0 0 0 2px #4779f51a}
+ .transit-option-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+ .transit-option-head h3{font-size:18px;margin:8px 0 0}
+ .transit-duration{font-size:13px;color:#4779f5;white-space:nowrap}
+ .time-arrow{color:#94a3b8;font-weight:400;padding:0 4px}
+ .transit-legs{margin:12px 0;border-top:1px solid #edf1f7}
+ .transit-leg{display:flex;gap:10px;padding:11px 2px;border-bottom:1px solid #edf1f7}
+ .transit-leg .leg-icon{width:30px;height:30px;display:grid;place-items:center;border-radius:10px;background:#eff4ff;flex-shrink:0}
+ .transit-leg b{font-size:13px;display:block}
+ .transit-leg p{font-size:12px;margin:4px 0;color:#43516a}
+ .transit-leg small{font-size:11px;color:#7a879b;display:block;margin-top:3px}
+ .walk-leg .leg-icon{background:#f2f4f8}
+ .transit-show-route{display:block;width:100%;text-align:center;cursor:pointer;box-sizing:border-box}
+ .transit-disclaimer{font-size:11px;color:#7a879b;line-height:1.7;margin:12px 2px 6px}
+ .transit-attribution{display:block;color:#8a96a8;font-size:10px;margin-top:8px}
+ `;
+ document.head.appendChild(style);
+})();
+
+function transitTime(secs){
+  if(!Number.isFinite(secs)) return "時刻不明";
+  // Transit API returns seconds from service-day midnight; may cross midnight.
+  const d = new Date();
+  d.setHours(0,0,0,0);
+  d.setSeconds(secs);
+  return d.toLocaleTimeString("ja-JP",{hour:"2-digit",minute:"2-digit"});
 }
+function transitDuration(secs){
+  if(!Number.isFinite(secs)) return "時間不明";
+  return fmtTime(secs);
+}
+function transitFare(fare){
+  if(!fare || !Number.isFinite(fare.ticket)) return "運賃情報なし";
+  const ticket = `${fare.ticket.toLocaleString("ja-JP")}円`;
+  return fare.ic != null && Number.isFinite(fare.ic)
+    ? `きっぷ ${ticket} / IC ${fare.ic.toLocaleString("ja-JP")}円`
+    : `きっぷ ${ticket}`;
+}
+function transitLegText(leg){
+  const fromName = leg.from?.name || "出発";
+  const toName = leg.to?.name || "到着";
+  if(leg.kind === "walk") {
+    return `<div class="transit-leg walk-leg"><span class="leg-icon">🚶</span><div><b>徒歩</b><p>${esc(fromName)} → ${esc(toName)}</p><small>${transitDuration((leg.arrivalSecs||0)-(leg.departureSecs||0))}</small></div></div>`;
+  }
+  const line = leg.routeName || "路線名不明";
+  const type = leg.trainType ? ` · ${esc(leg.trainType)}` : "";
+  const dep = transitTime(leg.departureSecs);
+  const arr = transitTime(leg.arrivalSecs);
+  const platform = leg.from?.platformCode ? ` · ${esc(leg.from.platformCode)}番線` : "";
+  const headsign = leg.headsign ? `<small>行先：${esc(leg.headsign)}</small>` : "";
+  return `<div class="transit-leg"><span class="leg-icon">🚆</span><div><b>${esc(line)}${type}</b><p>${esc(fromName)}${platform} → ${esc(toName)}</p><small>${dep} 発 → ${arr} 着</small>${headsign}</div></div>`;
+}
+function drawTransitOption(option){
+  if(routeLayer){map.removeLayer(routeLayer);routeLayer=null}
+  const segments = option?.map?.segments || [];
+  const layers = [];
+  segments.forEach(seg=>{
+    const pts=(seg.polyline||[]).filter(p=>Number.isFinite(p.lat)&&Number.isFinite(p.lon)).map(p=>[p.lat,p.lon]);
+    if(pts.length>1){
+      layers.push(L.polyline(pts,{color:seg.color|| (seg.kind==="walk"?"#9aa8bc":"#4779f5"),weight:seg.kind==="walk"?4:6,opacity:.9,dashArray:seg.kind==="walk"?"6 7":null,lineCap:"round",lineJoin:"round"}));
+    }
+  });
+  if(layers.length){
+    routeLayer=L.featureGroup(layers).addTo(map);
+    map.fitBounds(routeLayer.getBounds(),{padding:[40,40],maxZoom:15});
+  } else {
+    map.fitBounds(L.latLngBounds([[startPlace.lat,startPlace.lon],[endPlace.lat,endPlace.lon]]).pad(.2),{maxZoom:13});
+  }
+}
+function renderTransitOptions(data,from,to){
+  const options = Array.isArray(data.options) ? data.options : [];
+  if(!options.length){
+    $("routePanel").innerHTML=`<div class="empty"><span>!</span><div><b>電車の経路が見つかりませんでした</b><p>この区間の時刻表データがないか、検索範囲外の可能性があります。駅名を指定して再検索してみてください。</p></div></div>`;
+    setText("routeStatus","経路候補がありません。データの対象範囲や駅名を確認してください。");
+    if(routeLayer){map.removeLayer(routeLayer);routeLayer=null}
+    return;
+  }
+  const recommended = options.find(o=>o.recommended) || options[0];
+  const cards = options.map((o,i)=>{
+    const j=o.journey||{};
+    const legs=Array.isArray(j.legs)?j.legs:[];
+    const fare=j.fare||o.metrics?.fare;
+    const transfer=Number.isFinite(j.transferCount)?j.transferCount:(o.metrics?.transferCount||0);
+    const duration=Number.isFinite(j.durationSecs)?j.durationSecs:o.metrics?.durationSecs;
+    const dep=transitTime(j.departureSecs), arr=transitTime(j.arrivalSecs);
+    const selected=o.id===recommended.id;
+    return `<article class="transit-option ${selected?"selected":""}">
+      <div class="transit-option-head"><div><span class="route-badge">${selected?"おすすめ":`候補 ${i+1}`}</span><h3>${dep} <span class="time-arrow">→</span> ${arr}</h3></div><b class="transit-duration">${transitDuration(duration)}</b></div>
+      <div class="metrics"><div><b>${transfer}回</b><small>乗換</small></div><div><b>${esc(transitFare(fare))}</b><small>運賃</small></div></div>
+      <div class="transit-legs">${legs.map(transitLegText).join("")}</div>
+      <button type="button" class="route-link transit-show-route" data-transit-option="${i}">このルートを地図に表示</button>
+    </article>`;
+  }).join("");
+  $("routePanel").innerHTML=`<div class="route-summary"><div class="summary-top"><div><h3>電車・公共交通の経路</h3><p>${esc(from.name)} → ${esc(to.name)}</p></div><span class="route-badge">無料API</span></div>${cards}<p class="transit-disclaimer">経路・時刻は公開交通データに基づく参考情報です。運行状況や運賃の正確性は保証されません。</p><small class="transit-attribution">経路データ：Transit API（非公式）</small></div>`;
+  $("routePanel").querySelectorAll("[data-transit-option]").forEach(btn=>{
+    btn.addEventListener("click",()=>{
+      const option=options[Number(btn.dataset.transitOption)];
+      if(!option)return;
+      $("routePanel").querySelectorAll(".transit-option").forEach((el,i)=>el.classList.toggle("selected",i===Number(btn.dataset.transitOption)));
+      drawTransitOption(option);
+    });
+  });
+  drawTransitOption(recommended);
+  setText("routeStatus",`${options.length}件の経路候補を表示しました。`);
+}
+async function renderTransit(from,to,serial){
+  const params=new URLSearchParams({
+    from:`geo:${from.lat},${from.lon}`,
+    to:`geo:${to.lat},${to.lon}`,
+    fromLabel:from.name,
+    toLabel:to.name,
+    allowModes:"rail,subway,tram,monorail",
+    numItineraries:"3",
+    strategy:"balanced"
+  });
+  const res=await fetch(`${TRANSIT_API}/api/v1/guidance/plan?${params}`);
+  if(!res.ok)throw new Error(`電車経路APIの応答 ${res.status}`);
+  const data=await res.json();
+  if(serial!==routeSerial)return;
+  renderTransitOptions(data,from,to);
+}
+
 async function renderRoadRoute(from,to,mode,serial){
  const profile="driving";
  const coords=`${from.lon},${from.lat};${to.lon},${to.lat}`;
@@ -124,7 +244,14 @@ $("routeBtn").addEventListener("click",async()=>{
  if(!startPlace||!endPlace){setText("routeStatus","出発地と目的地を両方設定してください。検索結果のボタンから選べます。");return}
  if(startPlace.lat===endPlace.lat&&startPlace.lon===endPlace.lon){setText("routeStatus","出発地と目的地が同じ場所です。別の場所を選んでください。");return}
  const serial=++routeSerial;setText("routeStatus","行き方を調べています…");
- if(currentMode==="transit"){renderTransit(startPlace,endPlace);return}
- try{await renderRoadRoute(startPlace,endPlace,currentMode,serial)}catch(err){if(serial!==routeSerial)return;console.error(err);setText("routeStatus","ルートを取得できませんでした。外部の道順検索をお試しください。");$("routePanel").innerHTML=`<div class="empty"><span>!</span><div><b>ルートを取得できませんでした</b><p>サービスが混み合っているか、道路データがない可能性があります。</p><a class="route-link" target="_blank" rel="noopener noreferrer" href="${googleMapsTransitURL(startPlace,endPlace,currentMode)}">Google マップで道順を開く ↗</a></div></div>`}
+ try{
+  if(currentMode==="transit"){await renderTransit(startPlace,endPlace,serial);return}
+  await renderRoadRoute(startPlace,endPlace,currentMode,serial);
+ }catch(err){
+  if(serial!==routeSerial)return;
+  console.error(err);
+  setText("routeStatus",currentMode==="transit"?"電車の経路を取得できませんでした。少し時間をおいて再試行してください。":"ルートを取得できませんでした。外部の道順検索をお試しください。");
+  $("routePanel").innerHTML=`<div class="empty"><span>!</span><div><b>ルートを取得できませんでした</b><p>${currentMode==="transit"?"APIが混み合っているか、出発地・目的地の交通データがない可能性があります。":"サービスが混み合っているか、道路データがない可能性があります。"}</p><a class="route-link" target="_blank" rel="noopener noreferrer" href="${googleMapsTransitURL(startPlace,endPlace,currentMode)}">外部サービスで道順を開く ↗</a></div></div>`;
+ }
 });
 initMap();
